@@ -8,6 +8,8 @@ from urllib.parse import urlparse, parse_qs
 import requests
 from certifi import where
 
+from ..exts.config import default_api_prefix
+
 
 class Auth0:
     def __init__(self, email: str, password: str, proxy: str = None, use_cache: bool = True, mfa: str = None):
@@ -36,19 +38,32 @@ class Auth0:
         regex = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,7}\b'
         return re.fullmatch(regex, email)
 
-    def auth(self, login_local=True) -> str:
+    def auth(self, login_local=False) -> str:
         if self.use_cache and self.access_token and self.expires and self.expires > dt.now():
             return self.access_token
 
         if not self.__check_email(self.email) or not self.password:
             raise Exception('invalid email or password.')
 
-        return self.__part_two()
+        return self.__part_one() if login_local else self.get_access_token_proxy()
 
     def get_refresh_token(self):
         return self.refresh_token
 
-    def __part_two(self) -> str:
+    def __part_one(self) -> str:
+        url = '{}/auth/preauth'.format(default_api_prefix())
+        resp = self.session.get(url, allow_redirects=False, **self.req_kwargs)
+
+        if resp.status_code == 200:
+            json = resp.json()
+            if 'preauth_cookie' not in json or not json['preauth_cookie']:
+                raise Exception('Get preauth cookie failed.')
+
+            return self.__part_two(json['preauth_cookie'])
+        else:
+            raise Exception('Error request preauth.')
+
+    def __part_two(self, preauth: str) -> str:
         code_challenge = 'w6n3Ix420Xhhu-Q5-mOOEyuPZmAsJHUbBpO8Ub7xBCY'
         code_verifier = 'yGrXROHx_VazA0uovsxKfE263LMFcrSrdm4SlC-rob8'
 
@@ -56,7 +71,7 @@ class Auth0:
               '%2Fapi.openai.com%2Fv1&redirect_uri=com.openai.chat%3A%2F%2Fauth0.openai.com%2Fios%2Fcom.openai.chat' \
               '%2Fcallback&scope=openid%20email%20profile%20offline_access%20model.request%20model.read' \
               '%20organization.read%20offline&response_type=code&code_challenge={}' \
-              '&code_challenge_method=S256&prompt=login'.format(code_challenge)
+              '&code_challenge_method=S256&prompt=login&preauth_cookie={}'.format(code_challenge, preauth)
         return self.__part_three(code_verifier, url)
 
     def __part_three(self, code_verifier, url: str) -> str:
@@ -174,6 +189,21 @@ class Auth0:
         else:
             raise Exception('Error login.')
 
+    def __parse_access_token(self, resp):
+        if resp.status_code == 200:
+            json = resp.json()
+            if 'access_token' not in json:
+                raise Exception('Get access token failed, maybe you need a proxy.')
+
+            if 'refresh_token' in json:
+                self.refresh_token = json['refresh_token']
+
+            self.access_token = json['access_token']
+            self.expires = dt.utcnow() + datetime.timedelta(seconds=json['expires_in']) - datetime.timedelta(minutes=5)
+            return self.access_token
+        else:
+            raise Exception(resp.text)
+
     def get_access_token(self, code_verifier: str, callback_url: str) -> str:
         url_params = parse_qs(urlparse(callback_url).query)
 
@@ -198,16 +228,18 @@ class Auth0:
         }
         resp = self.session.post(url, headers=headers, json=data, allow_redirects=False, **self.req_kwargs)
 
-        if resp.status_code == 200:
-            json = resp.json()
-            if 'access_token' not in json:
-                raise Exception('Get access token failed, maybe you need a proxy.')
+        return self.__parse_access_token(resp)
 
-            if 'refresh_token' in json:
-                self.refresh_token = json['refresh_token']
+    def get_access_token_proxy(self) -> str:
+        url = '{}/auth/login'.format(default_api_prefix())
+        headers = {
+            'User-Agent': self.user_agent,
+        }
+        data = {
+            'username': self.email,
+            'password': self.password,
+            'mfa_code': self.mfa,
+        }
+        resp = self.session.post(url=url, headers=headers, data=data, allow_redirects=False, **self.req_kwargs)
 
-            self.access_token = json['access_token']
-            self.expires = dt.utcnow() + datetime.timedelta(seconds=json['expires_in']) - datetime.timedelta(minutes=5)
-            return self.access_token
-        else:
-            raise Exception(resp.text)
+        return self.__parse_access_token(resp)
